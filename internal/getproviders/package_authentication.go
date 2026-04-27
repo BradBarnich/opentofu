@@ -203,6 +203,16 @@ func (checks packageAuthenticationAll) AuthenticatePackage(localLocation Package
 		hashes: make(HashDispositions),
 	}
 	for _, check := range checks {
+		if _, localLocationIsDir := localLocation.(PackageLocalDir); localLocationIsDir {
+			if _, checkIsArchiveHash := check.(archiveHashAuthentication); checkIsArchiveHash {
+				// The global provider cache stores unpacked package directories,
+				// so there is no original zip archive to checksum. Other
+				// authenticators in the combined registry authentication can
+				// still validate the directory through h1 hashes and signed
+				// checksum metadata.
+				continue
+			}
+		}
 		thisAuthResult, err := check.AuthenticatePackage(localLocation)
 		if err != nil {
 			return nil, err
@@ -436,20 +446,31 @@ func (a *registryPackageAuthentication) AuthenticatePackage(localLocation Packag
 	if !ok {
 		return nil, fmt.Errorf("registry response missing package with platform %q", a.Meta.TargetPlatform)
 	}
-	// Validatepackage size
-	if platformData.PackageSize <= 0 {
-		return nil, fmt.Errorf("registry response has invalid package size %v", platformData.PackageSize)
-	}
-	archivePath, err := filepath.EvalSymlinks(localLocation.String())
-	if err != nil {
-		return nil, err
-	}
-	stat, err := os.Stat(archivePath)
-	if err != nil {
-		return nil, err
-	}
-	if stat.Size() != platformData.PackageSize {
-		return nil, fmt.Errorf("registry response indicates a package of size %v, but received a package of size %v", platformData.PackageSize, stat.Size())
+	if _, ok := localLocation.(PackageLocalDir); ok {
+		matches, err := PackageMatchesAnyHash(localLocation, platformData.Hashes)
+		if err != nil {
+			return nil, err
+		}
+		if !matches {
+			return nil, fmt.Errorf("provider package doesn't match any of the checksums reported by the registry")
+		}
+	} else {
+		// Validate package size for archive locations. Unpacked cache entries
+		// do not have the same byte size as their original archives.
+		if platformData.PackageSize <= 0 {
+			return nil, fmt.Errorf("registry response has invalid package size %v", platformData.PackageSize)
+		}
+		archivePath, err := filepath.EvalSymlinks(localLocation.String())
+		if err != nil {
+			return nil, err
+		}
+		stat, err := os.Stat(archivePath)
+		if err != nil {
+			return nil, err
+		}
+		if stat.Size() != platformData.PackageSize {
+			return nil, fmt.Errorf("registry response indicates a package of size %v, but received a package of size %v", platformData.PackageSize, stat.Size())
+		}
 	}
 
 	// Validate platform specific hash data

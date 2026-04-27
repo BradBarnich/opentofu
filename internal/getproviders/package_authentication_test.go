@@ -210,6 +210,22 @@ func TestPackageAuthenticationAll_failure(t *testing.T) {
 	}
 }
 
+func TestPackageAuthenticationAll_unpackedCacheEntrySkipsArchiveChecksum(t *testing.T) {
+	location := PackageLocalDir(filepath.FromSlash("testdata/filesystem-mirror/registry.opentofu.org/hashicorp/null/2.0.0/linux_amd64"))
+	hash := Hash("h1:qjsREM4DqEWECD43FcPqddZ9oxCG+IaMTxvWPciS05g=")
+	result, err := PackageAuthenticationAll(
+		NewPackageHashAuthentication(Platform{"linux", "amd64"}, []Hash{hash}, false),
+		NewArchiveChecksumAuthentication(Platform{"linux", "amd64"}, [sha256.Size]byte{}),
+	).AuthenticatePackage(location)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if got, want := result.String(), "verified checksum"; got != want {
+		t.Errorf("wrong result summary\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
 // Package hash authentication requires a zip file or directory fixture and a
 // known-good set of hashes, of which the authenticator will pick one. The
 // result should be "verified checksum".
@@ -475,6 +491,7 @@ func TestMatchingChecksumAuthentication_failure(t *testing.T) {
 
 func TestRegistryPackageAuthentication(t *testing.T) {
 	location := PackageLocalArchive("testdata/filesystem-mirror/registry.opentofu.org/hashicorp/null/terraform-provider-null_2.1.0_linux_amd64.zip")
+	unpackedLocation := PackageLocalDir(filepath.FromSlash("testdata/filesystem-mirror/registry.opentofu.org/hashicorp/null/2.0.0/linux_amd64"))
 	platform := Platform{"linux", "amd64"}
 	meta := PackageMeta{
 		Provider:       addrs.MustParseProviderSourceString("registry.opentofu.org/hashicorp/null"),
@@ -483,8 +500,10 @@ func TestRegistryPackageAuthentication(t *testing.T) {
 	}
 	validSha := "086119a26576d06b8281a97e8644380da89ce16197cd955f74ea5ee664e9358b"
 	validH1 := "tru5tm3br0"
+	validUnpackedH1 := "qjsREM4DqEWECD43FcPqddZ9oxCG+IaMTxvWPciS05g="
 	zh := Hash("zh:" + validSha)
 	h1 := Hash("h1:" + validH1)
+	unpackedH1 := Hash("h1:" + validUnpackedH1)
 
 	tests := []struct {
 		name        string
@@ -510,6 +529,20 @@ func TestRegistryPackageAuthentication(t *testing.T) {
 		result: &PackageAuthenticationResult{hashes: HashDispositions{
 			h1: &HashDisposition{ReportedByRegistry: true, Platform: &platform},
 			zh: &HashDisposition{ReportedByRegistry: true, Platform: &platform},
+		}},
+	}, {
+		name:     "success_unpacked_cache_entry",
+		location: unpackedLocation,
+		sha:      validSha,
+		packageData: map[Platform]RegistryPlatformData{
+			platform: {
+				Hashes:      []Hash{zh, unpackedH1},
+				PackageSize: 294,
+			},
+		},
+		result: &PackageAuthenticationResult{hashes: HashDispositions{
+			unpackedH1: &HashDisposition{ReportedByRegistry: true, Platform: &platform},
+			zh:         &HashDisposition{ReportedByRegistry: true, Platform: &platform},
 		}},
 	}, {
 		name:        "missing_platform",
@@ -561,6 +594,17 @@ func TestRegistryPackageAuthentication(t *testing.T) {
 			},
 		},
 		err: "registry response does not contain matching sha256sum package entry and is invalid",
+	}, {
+		name:     "unpacked_cache_entry_hash_mismatch",
+		location: unpackedLocation,
+		sha:      validSha,
+		packageData: map[Platform]RegistryPlatformData{
+			platform: {
+				Hashes:      []Hash{zh, h1},
+				PackageSize: 294,
+			},
+		},
+		err: "provider package doesn't match any of the checksums reported by the registry",
 	}}
 
 	for _, tc := range tests {

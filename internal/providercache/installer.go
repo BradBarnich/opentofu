@@ -7,8 +7,11 @@ package providercache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -656,6 +659,24 @@ func (i *Installer) ensureProviderVersionInDirectory(
 		return nil, nil, err
 	}
 
+	if installed := installTo.ProviderVersion(provider, version); installed != nil && meta.Authentication != nil {
+		authResult, err := meta.Authentication.AuthenticatePackage(installed.PackageLocation())
+		if err == nil {
+			if _, err := installed.ExecutableFile(); err != nil {
+				log.Printf("[TRACE] providercache: ignoring cached %s %s in %s because the provider binary was not found: %s", provider, version, installTo.BasePath(), err)
+			} else if newHashes, err := i.providerLockHashes(ctx, lock, provider, version, installed, authResult, preferredHashes); err != nil {
+				log.Printf("[TRACE] providercache: ignoring cached %s %s in %s because its checksums could not be recorded: %s", provider, version, installTo.BasePath(), err)
+			} else {
+				if cb := evts.ProviderAlreadyInstalled; cb != nil {
+					cb(provider, version, isGlobalCache)
+				}
+				return nil, newHashes, nil
+			}
+		} else {
+			log.Printf("[TRACE] providercache: ignoring cached %s %s in %s because it did not pass package authentication: %s", provider, version, installTo.BasePath(), err)
+		}
+	}
+
 	// Step 3c: Retrieve the package indicated by the metadata we received,
 	// either directly into our target directory or via the global cache
 	// directory.
@@ -670,9 +691,11 @@ func (i *Installer) ensureProviderVersionInDirectory(
 
 	allowSkippingInstallWithoutHashes := i.globalCacheDirMayBreakDependencyLockFile && isGlobalCache
 	authResult, err := installTo.InstallPackage(ctx, meta, allowedHashes, allowSkippingInstallWithoutHashes)
+	if err != nil && providerPackageInstallErrorIsRetryable(ctx, err) {
+		log.Printf("[TRACE] providercache: retrying installation of %s %s after transient error: %s", provider, version, err)
+		authResult, err = installTo.InstallPackage(ctx, meta, allowedHashes, allowSkippingInstallWithoutHashes)
+	}
 	if err != nil {
-		// TODO: Consider retrying for certain kinds of error that seem
-		// likely to be transient. For now, we just treat all errors equally.
 		if cb := evts.FetchPackageFailure; cb != nil {
 			cb(provider, version, err)
 		}
@@ -710,6 +733,52 @@ func (i *Installer) ensureProviderVersionInDirectory(
 	// The hashes slice gets deduplicated in the lock file
 	// implementation, so we don't worry about potentially
 	// creating duplicates here.
+	newHashes, err := i.providerLockHashes(ctx, lock, provider, version, new, authResult, preferredHashes)
+	if err != nil {
+		if cb := evts.FetchPackageFailure; cb != nil {
+			cb(provider, version, err)
+		}
+		return authResult, nil, err
+	}
+
+	if cb := evts.FetchPackageSuccess; cb != nil {
+		cb(provider, version, new.PackageDir, authResult)
+	}
+
+	return authResult, newHashes, nil
+}
+
+func providerPackageInstallErrorIsRetryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	if os.IsTimeout(err) {
+		return true
+	}
+
+	errMsg := strings.ToLower(err.Error())
+	return strings.Contains(errMsg, "incorrect response size:") ||
+		strings.Contains(errMsg, "connection reset by peer") ||
+		strings.Contains(errMsg, "connection aborted") ||
+		strings.Contains(errMsg, "broken pipe")
+}
+
+func (i *Installer) providerLockHashes(
+	ctx context.Context,
+	lock *depsfile.ProviderLock,
+	provider addrs.Provider,
+	version getproviders.Version,
+	new *CachedProvider,
+	authResult *getproviders.PackageAuthenticationResult,
+	preferredHashes []getproviders.Hash,
+) ([]getproviders.Hash, error) {
+	evts := installerEventsForContext(ctx)
+
 	var priorHashes []getproviders.Hash
 	if lock != nil && lock.Version() == version {
 		// If the version we're installing is identical to the
@@ -721,15 +790,11 @@ func (i *Installer) ensureProviderVersionInDirectory(
 	}
 	newHash, err := new.Hash()
 	if err != nil {
-		err := fmt.Errorf("after installing %s, failed to compute a checksum for it: %w", provider, err)
-		if cb := evts.FetchPackageFailure; cb != nil {
-			cb(provider, version, err)
-		}
-		return authResult, nil, err
+		return nil, fmt.Errorf("after selecting %s, failed to compute a checksum for it: %w", provider, err)
 	}
 
 	// localHashes is the set of hashes that we were able to verify locally
-	// based on the data we downloaded.
+	// based on the package we selected.
 	localHashes := slices.Collect(authResult.HashesWithDisposition(func(hd *getproviders.HashDisposition) bool {
 		return hd.VerifiedLocally
 	}))
@@ -780,11 +845,7 @@ func (i *Installer) ensureProviderVersionInDirectory(
 		cb(provider, version, localHashes, signedHashes, priorHashes)
 	}
 
-	if cb := evts.FetchPackageSuccess; cb != nil {
-		cb(provider, version, new.PackageDir, authResult)
-	}
-
-	return authResult, newHashes, nil
+	return newHashes, nil
 }
 
 // checkUnspecifiedVersion Check the presence of version 0.0.0 and return an error with a tip
